@@ -6,13 +6,13 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"sort"
 	"sync"
 	"time"
 	"unsafe"
 
 	berrors "go.etcd.io/bbolt/errors"
 	"go.etcd.io/bbolt/internal/common"
+	fl "go.etcd.io/bbolt/internal/freelist"
 )
 
 // The time elapsed between consecutive file locking attempts.
@@ -134,7 +134,7 @@ type DB struct {
 	rwtx     *Tx
 	txs      []*Tx
 
-	freelist     *freelist
+	freelist     fl.Interface
 	freelistLoad sync.Once
 
 	pagePool sync.Pool
@@ -419,12 +419,12 @@ func (db *DB) loadFreelist() {
 		db.freelist = newFreelist(db.FreelistType)
 		if !db.hasSyncedFreelist() {
 			// Reconstruct free list by scanning the DB.
-			db.freelist.readIDs(db.freepages())
+			db.freelist.Init(db.freepages())
 		} else {
 			// Read free list from freelist page.
-			db.freelist.read(db.page(db.meta().Freelist()))
+			db.freelist.Read(db.page(db.meta().Freelist()))
 		}
-		db.stats.FreePageN = db.freelist.free_count()
+		db.stats.FreePageN = db.freelist.FreeCount()
 	})
 }
 
@@ -797,6 +797,9 @@ func (db *DB) beginTx() (*Tx, error) {
 	// Keep track of transaction until it closes.
 	db.txs = append(db.txs, t)
 	n := len(db.txs)
+	if db.freelist != nil {
+		db.freelist.AddReadonlyTXID(t.meta.Txid())
+	}
 
 	// Unlock the meta pages.
 	db.metalock.Unlock()
@@ -841,35 +844,9 @@ func (db *DB) beginRWTx() (*Tx, error) {
 	t := &Tx{writable: true}
 	t.init(db)
 	db.rwtx = t
-	db.freePages()
+	db.freelist.ReleasePendingPages()
 	return t, nil
 }
-
-// freePages releases any pages associated with closed read-only transactions.
-func (db *DB) freePages() {
-	// Free all pending pages prior to earliest open transaction.
-	sort.Sort(txsById(db.txs))
-	minid := common.Txid(0xFFFFFFFFFFFFFFFF)
-	if len(db.txs) > 0 {
-		minid = db.txs[0].meta.Txid()
-	}
-	if minid > 0 {
-		db.freelist.release(minid - 1)
-	}
-	// Release unused txid extents.
-	for _, t := range db.txs {
-		db.freelist.releaseRange(minid, t.meta.Txid()-1)
-		minid = t.meta.Txid() + 1
-	}
-	db.freelist.releaseRange(minid, common.Txid(0xFFFFFFFFFFFFFFFF))
-	// Any page both allocated and freed in an extent is safe to release.
-}
-
-type txsById []*Tx
-
-func (t txsById) Len() int           { return len(t) }
-func (t txsById) Swap(i, j int)      { t[i], t[j] = t[j], t[i] }
-func (t txsById) Less(i, j int) bool { return t[i].meta.Txid() < t[j].meta.Txid() }
 
 // removeTx removes a transaction from the database.
 func (db *DB) removeTx(tx *Tx) {
@@ -890,6 +867,9 @@ func (db *DB) removeTx(tx *Tx) {
 		}
 	}
 	n := len(db.txs)
+	if db.freelist != nil {
+		db.freelist.RemoveReadonlyTXID(tx.meta.Txid())
+	}
 
 	// Unlock the meta pages.
 	db.metalock.Unlock()
@@ -1176,7 +1156,7 @@ func (db *DB) allocate(txid common.Txid, count int) (*common.Page, error) {
 	p.SetOverflow(uint32(count - 1))
 
 	// Use pages from the freelist if they are available.
-	p.SetId(db.freelist.allocate(txid, count))
+	p.SetId(db.freelist.Allocate(txid, count))
 	if p.Id() != 0 {
 		return p, nil
 	}
@@ -1280,6 +1260,13 @@ func (db *DB) freepages() []common.Pgid {
 		}
 	}
 	return fids
+}
+
+func newFreelist(freelistType FreelistType) fl.Interface {
+	if freelistType == FreelistMapType {
+		return fl.NewHashMapFreelist()
+	}
+	return fl.NewArrayFreelist()
 }
 
 // Options represents the options that can be set when opening a database.
